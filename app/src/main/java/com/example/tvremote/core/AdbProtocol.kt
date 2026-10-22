@@ -23,13 +23,9 @@ object AdbProtocol {
     const val CONNECT_VERSION = 0x01000000
     const val CONNECT_MAXDATA = 256 * 1024
 
-    class Header(val cmd: Int, val arg0: Int, val arg1: Int, val dataLength: Int, val dataCrc32: Int) {
-        /** False means the header is corrupt (should never happen over TCP, but we still check). */
-        fun magicOk(): Boolean = (cmd xor magicFor(cmd)) == -1
-
-        companion object {
-            private fun magicFor(cmd: Int) = cmd.inv()
-        }
+    class Header(val cmd: Int, val arg0: Int, val arg1: Int, val dataLength: Int, val dataCrc32: Int, val magic: Int) {
+        /** False means the header is corrupt: the independently-transmitted magic field no longer matches cmd. */
+        fun magicOk(): Boolean = magic == cmd.inv()
     }
 
     fun encodeMessage(cmd: Int, arg0: Int, arg1: Int, payload: ByteArray): ByteArray {
@@ -46,7 +42,7 @@ object AdbProtocol {
 
     fun parseHeader(header: ByteArray): Header {
         require(header.size == HEADER_SIZE)
-        return Header(getInt(header, 0), getInt(header, 4), getInt(header, 8), getInt(header, 12), getInt(header, 16))
+        return Header(getInt(header, 0), getInt(header, 4), getInt(header, 8), getInt(header, 12), getInt(header, 16), getInt(header, 20))
     }
 
     fun crc32(data: ByteArray): Int {
