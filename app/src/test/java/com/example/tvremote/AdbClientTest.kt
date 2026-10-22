@@ -2,6 +2,7 @@ package com.example.tvremote
 
 import com.example.tvremote.core.AdbProtocol
 import com.example.tvremote.core.AdbRsaKey
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
