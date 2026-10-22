@@ -120,6 +120,28 @@ class AdbCoreTest {
         assertArrayEquals(AdbRsaKey.mincryptStruct(kp.public), decoded)
     }
 
+    @Test fun shellCommandsBuildExpectedText() {
+        assertEquals("pm list packages -f -3", ShellCommands.listPackages(false))
+        assertEquals("pm list packages -f", ShellCommands.listPackages(true))
+        assertEquals("pm uninstall --user 0 'com.foo.bar'", ShellCommands.uninstall("com.foo.bar"))
+        assertEquals("pm clear 'com.foo.bar'", ShellCommands.clearData("com.foo.bar"))
+        assertEquals("cmd package install -r -t -S 12345 -", ShellCommands.installFromStdin(12345L))
+        assertEquals("cmd locale set-locale 'ru-RU'", ShellCommands.setLocale("ru-RU"))
+        assertEquals("wm size 1920x1080", ShellCommands.setResolution(1920, 1080))
+        assertEquals("wm size reset", ShellCommands.resetResolution())
+        assertEquals("wm density 320", ShellCommands.setDensity(320))
+    }
+
+    @Test fun parsePackageLineHandlesPathAndPlainForms() {
+        val a = ShellCommands.parsePackageLine("package:/data/app/~~x==/com.foo.bar-1/base.apk=com.foo.bar")
+        assertEquals("com.foo.bar", a!!.pkg)
+        assertEquals("/data/app/~~x==/com.foo.bar-1/base.apk", a.apkPath)
+        val b = ShellCommands.parsePackageLine("package:com.foo.bar")
+        assertEquals("com.foo.bar", b!!.pkg)
+        assertEquals("", b.apkPath)
+        assertEquals(null, ShellCommands.parsePackageLine("package:"))
+    }
+
     @Test fun shellQuoteEscapesSingleQuotes() {
         assertEquals("'hello'", ShellQuote.single("hello"))
         assertEquals("'it'\\''s'", ShellQuote.single("it's"))

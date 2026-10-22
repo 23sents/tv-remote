@@ -23,6 +23,8 @@ private class FakeAdbd(
     private val pool = Executors.newCachedThreadPool()
     @Volatile var sawShellCommand: String? = null
     @Volatile var closedCleanly = false
+    @Volatile var receivedData: ByteArray? = null
+    var handlePush = false
 
     init {
         port = server.localPort
@@ -71,7 +73,6 @@ private class FakeAdbd(
 
         if (!handleShellAfterConnect) return
 
-        // shell: open -> write some output in two chunks -> close
         h = readHeader(s)
         val openPayload = readPayload(s, h)
         val service = String(openPayload, Charsets.UTF_8).trimEnd('\u0000')
@@ -79,6 +80,29 @@ private class FakeAdbd(
         val localId = h.arg0
         val remoteId = 777
         send(s, AdbProtocol.CMD_OKAY, remoteId, localId, ByteArray(0))
+
+        if (handlePush) {
+            // keep reading WRTE chunks (acking each) until the client has nothing more to send, detected by
+            // the client's next action being a plain shell read -- in this fake, the test tells us the total
+            // size up front via sawShellCommand's "-S <n>" so we know exactly how many bytes to expect.
+            val n = Regex("-S (\\d+)").find(sawShellCommand ?: "")!!.groupValues[1].toInt()
+            val buf = java.io.ByteArrayOutputStream()
+            while (buf.size() < n) {
+                val ch = readHeader(s)
+                val data = readPayload(s, ch)
+                buf.write(data)
+                send(s, AdbProtocol.CMD_OKAY, remoteId, localId, ByteArray(0))
+            }
+            receivedData = buf.toByteArray()
+            send(s, AdbProtocol.CMD_WRTE, remoteId, localId, "Success\n".toByteArray())
+            readHeader(s).also { readPayload(s, it) }
+            send(s, AdbProtocol.CMD_CLSE, remoteId, localId, ByteArray(0))
+            h = readHeader(s); readPayload(s, h)
+            closedCleanly = h.cmd == AdbProtocol.CMD_CLSE
+            return
+        }
+
+        // shell: open -> write some output in two chunks -> close
         send(s, AdbProtocol.CMD_WRTE, remoteId, localId, "hello ".toByteArray())
         readHeader(s).also { readPayload(s, it) }     // client's OKAY ack
         send(s, AdbProtocol.CMD_WRTE, remoteId, localId, "world".toByteArray())
@@ -135,5 +159,26 @@ class AdbClientTest {
         assertEquals("hello world", result.output)
         assertEquals("input keyevent 22", server.sawShellCommand)
         assertTrue(server.closedCleanly)
+    }
+
+    @Test fun installApkStreamsDataWithFlowControlAndReportsSuccess() {
+        val kp = keyPair()
+        val server = FakeAdbd(trustedKey = kp.public, approveOnPubkey = true, handleShellAfterConnect = true)
+        server.handlePush = true
+        val accept = server.acceptOnce()
+        val client = AdbClient("127.0.0.1", server.port, kp)
+        assertTrue(client.connect() is AdbResult.Connected)
+
+        val apk = ByteArray(40_000) { (it % 251).toByte() }   // bigger than one 16 KB push chunk
+        val progress = ArrayList<Pair<Long, Long>>()
+        val result = client.installApk(apk) { sent, total -> progress.add(sent to total) }
+        accept.get(5, java.util.concurrent.TimeUnit.SECONDS)
+
+        assertTrue(result.ok)
+        assertTrue(result.output.contains("Success"))
+        assertArrayEquals(apk, server.receivedData)
+        assertTrue(progress.size >= 3)                         // 40000 / 16384 -> 3 chunks
+        assertEquals(40_000L, progress.last().first)
+        assertTrue(progress.all { it.second == 40_000L })
     }
 }

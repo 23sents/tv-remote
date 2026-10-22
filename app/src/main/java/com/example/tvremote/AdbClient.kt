@@ -17,9 +17,9 @@ sealed class AdbResult {
 class ShellResult(val ok: Boolean, val output: String)
 
 /**
- * A minimal ADB client: TCP transport + the CNXN/AUTH handshake + one-shot `shell:` commands. This is the same
- * wire protocol the `adb` desktop tool speaks (see core.AdbProtocol); only what a remote-control app needs is
- * implemented (no file sync, no port forwarding, no interactive shell).
+ * A minimal ADB client: TCP transport + the CNXN/AUTH handshake + one-shot `shell:`/`exec:` streams. This is
+ * the same wire protocol the `adb` desktop tool speaks (see core.AdbProtocol); only what this app needs is
+ * implemented (no file sync service, no port forwarding, no interactive shell).
  */
 class AdbClient(private val host: String, private val port: Int, private val keyPair: KeyPair) {
     private var socket: Socket? = null
@@ -80,17 +80,59 @@ class AdbClient(private val host: String, private val port: Int, private val key
     @Throws(IOException::class)
     fun shell(command: String, timeoutMs: Int = 8000): ShellResult {
         val s = socket ?: return ShellResult(false, "не подключено")
+        return runStream(s, AdbProtocol.shellService(command), null, timeoutMs, null)
+    }
+
+    /**
+     * Installs an APK already read into memory, streaming it to `cmd package install` over the same connection
+     * (no separate ADB "sync" file-push service needed). [onProgress] reports bytes sent so far / total.
+     */
+    @Synchronized
+    @Throws(IOException::class)
+    fun installApk(apk: ByteArray, timeoutMs: Int = 60_000, onProgress: ((Long, Long) -> Unit)? = null): ShellResult {
+        val s = socket ?: return ShellResult(false, "не подключено")
+        val service = ("exec:" + com.example.tvremote.core.ShellCommands.installFromStdin(apk.size.toLong()) + "\u0000")
+            .toByteArray(Charsets.UTF_8)
+        return runStream(s, service, apk, timeoutMs, onProgress)
+    }
+
+    fun close() {
+        try { socket?.close() } catch (e: IOException) { }
+        socket = null
+        connected = false
+    }
+
+    // ------------------------------------------------------------------ internals
+    private fun fail(msg: String): AdbResult {
+        close()
+        return AdbResult.Failed(msg)
+    }
+
+    /** Opens one `service` stream, optionally pushes [pushData] to its stdin first, then collects whatever the
+     * device writes back until it closes the stream. */
+    private fun runStream(
+        s: Socket, service: ByteArray, pushData: ByteArray?, timeoutMs: Int, onProgress: ((Long, Long) -> Unit)?,
+    ): ShellResult {
         s.soTimeout = timeoutMs
         val localId = nextLocalId++
-        send(s, AdbProtocol.CMD_OPEN, localId, 0, AdbProtocol.shellService(command))
+        send(s, AdbProtocol.CMD_OPEN, localId, 0, service)
 
         var remoteId = -1
+        var pushed = false
         val out = StringBuilder()
         while (true) {
-            val header = readHeader(s) ?: return ShellResult(out.isEmpty(), out.toString())
+            val header = readHeader(s) ?: return ShellResult(false, out.toString())
             val payload = readPayload(s, header)
             when (header.cmd) {
-                AdbProtocol.CMD_OKAY -> remoteId = header.arg0
+                AdbProtocol.CMD_OKAY -> {
+                    if (remoteId < 0) {
+                        remoteId = header.arg0
+                        if (pushData != null && !pushed) {
+                            pushed = true
+                            pushAll(s, localId, remoteId, pushData, onProgress)
+                        }
+                    }
+                }
                 AdbProtocol.CMD_WRTE -> {
                     out.append(payload.toString(Charsets.UTF_8))
                     send(s, AdbProtocol.CMD_OKAY, localId, header.arg0, ByteArray(0))
@@ -104,15 +146,23 @@ class AdbClient(private val host: String, private val port: Int, private val key
         }
     }
 
-    fun close() {
-        try { socket?.close() } catch (e: IOException) { }
-        socket = null
-        connected = false
-    }
-
-    private fun fail(msg: String): AdbResult {
-        close()
-        return AdbResult.Failed(msg)
+    /** Writes [data] as a sequence of WRTE chunks, each acknowledged by the device before the next is sent
+     * (the same flow control the real ADB sync/exec file transfer uses), well under any device's advertised
+     * max payload so we never need to know what that is. */
+    private fun pushAll(s: Socket, localId: Int, remoteId: Int, data: ByteArray, onProgress: ((Long, Long) -> Unit)?) {
+        var offset = 0
+        val total = data.size.toLong()
+        while (offset < data.size) {
+            val len = minOf(PUSH_CHUNK, data.size - offset)
+            send(s, AdbProtocol.CMD_WRTE, localId, remoteId, data.copyOfRange(offset, offset + len))
+            val ackHeader = readHeader(s) ?: throw IOException("Телевизор прервал передачу")
+            readPayload(s, ackHeader)
+            if (ackHeader.cmd != AdbProtocol.CMD_OKAY) {
+                throw IOException("Неожиданный ответ во время передачи (" + AdbProtocol.cmdName(ackHeader.cmd) + ")")
+            }
+            offset += len
+            onProgress?.invoke(offset.toLong(), total)
+        }
     }
 
     private fun send(s: Socket, cmd: Int, arg0: Int, arg1: Int, payload: ByteArray) {
@@ -142,5 +192,9 @@ class AdbClient(private val host: String, private val port: Int, private val key
             off += n
         }
         return true
+    }
+
+    private companion object {
+        const val PUSH_CHUNK = 16 * 1024
     }
 }

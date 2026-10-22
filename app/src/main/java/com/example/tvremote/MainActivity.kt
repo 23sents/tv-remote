@@ -1,25 +1,37 @@
 package com.example.tvremote
 
 import android.app.Activity
+import android.app.Dialog
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
-import android.widget.ArrayAdapter
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.example.tvremote.core.AppShortcut
+import com.example.tvremote.core.DefaultApps
 import com.example.tvremote.core.RemoteKeys
+import com.example.tvremote.core.ShellCommands
 import com.example.tvremote.core.ShellQuote
 import java.util.concurrent.Executors
+
+/** A progress dialog with a settable bar, used while pushing an APK to the TV. */
+private class InstallDialog(private val dialog: Dialog, private val bar: ProgressBar) {
+    fun setProgress(percent: Int) { bar.progress = percent }
+    fun dismiss() = dialog.dismiss()
+}
 
 class MainActivity : Activity() {
     private val io = Executors.newSingleThreadExecutor()
@@ -28,9 +40,17 @@ class MainActivity : Activity() {
     private var client: AdbClient? = null
 
     private lateinit var root: FrameLayout
-    private var status: TextView? = null
     private var capture: KeyCaptureView? = null
     private var kbShown = false
+
+    // tabs (built once the TV is connected)
+    private var tabHost: FrameLayout? = null
+    private var tabBarViews: Array<TextView>? = null
+    private var remoteScreen: View? = null
+    private var appsScreen: AppsScreen? = null
+    private var tvSettingsScreen: TvSettingsScreen? = null
+    private var moreScreen: View? = null
+    private var currentTab = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -98,7 +118,6 @@ class MainActivity : Activity() {
         col.addView(port, lp(10))
 
         val statusText = label("", 14f, alpha = 200).apply { gravity = Gravity.CENTER }
-        status = statusText
 
         col.addView(
             Glass.button(this, "Подключиться", 0x553A7BFF, 0x883A7BFF.toInt()) {
@@ -147,7 +166,7 @@ class MainActivity : Activity() {
                         prefs.lastHost = host
                         prefs.lastPort = port
                         prefs.rememberHost("$host:$port")
-                        showRemote()
+                        showTabs()
                     }
                     is AdbResult.AwaitingApproval -> statusText.text =
                         "Посмотрите на экран телевизора и подтвердите подключение обычным пультом, затем нажмите «Подключиться» ещё раз"
@@ -157,18 +176,71 @@ class MainActivity : Activity() {
         }
     }
 
-    // ------------------------------------------------------------------ remote screen
-    private fun showRemote() {
+    // ------------------------------------------------------------------ tabs
+    private fun showTabs() {
+        remoteScreen = null
+        appsScreen = null
+        tvSettingsScreen = null
+        moreScreen = null
+
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val host = FrameLayout(this)
+        tabHost = host
+        column.addView(host, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        column.addView(
+            tabBar(),
+            LinearLayout.LayoutParams(MATCH, WRAP).apply { setMargins(dp(14f), dp(6f), dp(14f), dp(10f)) }
+        )
+        setScreen(column)
+        showTab(0)
+    }
+
+    private fun tabBar(): View {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = Glass.drawable(this@MainActivity, 26f, 0x33FFFFFF)
+            setPadding(dp(6f), dp(6f), dp(6f), dp(6f))
+        }
+        val labels = listOf("🎮\nПульт", "📦\nПриложения", "📺\nТВ", "⋯\nЕщё")
+        val views = Array(4) { i ->
+            TextView(this).apply {
+                text = labels[i]
+                setTextColor(Color.WHITE)
+                textSize = 11f
+                gravity = Gravity.CENTER
+                setPadding(0, dp(6f), 0, dp(6f))
+                setOnClickListener { showTab(i) }
+            }
+        }
+        tabBarViews = views
+        for (v in views) bar.addView(v, LinearLayout.LayoutParams(0, WRAP, 1f))
+        return bar
+    }
+
+    private fun showTab(i: Int) {
+        currentTab = i
+        val host = tabHost ?: return
+        host.removeAllViews()
+        val view = when (i) {
+            0 -> remoteScreen ?: buildRemoteScreen().also { remoteScreen = it }
+            1 -> appsScreen ?: AppsScreen(this).also { appsScreen = it }
+            2 -> tvSettingsScreen ?: TvSettingsScreen(this).also { tvSettingsScreen = it }
+            else -> moreScreen ?: buildMoreScreen().also { moreScreen = it }
+        }
+        host.addView(view, FrameLayout.LayoutParams(MATCH, MATCH))
+        tabBarViews?.forEachIndexed { k, v -> v.background = if (k == i) Glass.drawable(this, 20f, 0x40FFFFFF) else null }
+    }
+
+    // ------------------------------------------------------------------ remote tab
+    private fun buildRemoteScreen(): View {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(18f), dp(22f), dp(18f), dp(18f))
+            setPadding(dp(18f), dp(20f), dp(18f), dp(10f))
         }
 
         val topRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val st = label("● подключено", 13f, alpha = 200)
-        status = st
-        topRow.addView(st, LinearLayout.LayoutParams(0, WRAP, 1f))
+        topRow.addView(label("● подключено", 13f, alpha = 200), LinearLayout.LayoutParams(0, WRAP, 1f))
         topRow.addView(Glass.button(this, "Отключить", 0x24FFFFFF) {
             client?.close()
             client = null
@@ -176,47 +248,41 @@ class MainActivity : Activity() {
         }.apply { textSize = 13f; setPadding(dp(14f), dp(8f), dp(14f), dp(8f)) })
         col.addView(topRow, LinearLayout.LayoutParams(MATCH, WRAP))
 
-        col.addView(dpad(), LinearLayout.LayoutParams(dp(260f), dp(260f)).apply { topMargin = dp(26f) })
+        col.addView(dpad(), LinearLayout.LayoutParams(dp(250f), dp(250f)).apply { topMargin = dp(20f) })
 
         val navRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         navRow.addView(Glass.key(this, "◁", 22f) { sendKey(RemoteKeys.BACK) }, rowLp())
         navRow.addView(Glass.key(this, "◯", 22f) { sendKey(RemoteKeys.HOME) }, rowLp())
         navRow.addView(Glass.key(this, "⌨", 20f) { toggleKeyboard() }, rowLp())
-        col.addView(navRow, LinearLayout.LayoutParams(MATCH, dp(64f)).apply { topMargin = dp(18f) })
+        col.addView(navRow, LinearLayout.LayoutParams(MATCH, dp(60f)).apply { topMargin = dp(16f) })
 
         val volRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         volRow.addView(Glass.key(this, "－", 24f) { sendKey(RemoteKeys.VOLUME_DOWN) }, rowLp())
         volRow.addView(label("Громкость", 13f, alpha = 170).apply { gravity = Gravity.CENTER }, rowLp())
         volRow.addView(Glass.key(this, "＋", 24f) { sendKey(RemoteKeys.VOLUME_UP) }, rowLp())
-        col.addView(volRow, LinearLayout.LayoutParams(MATCH, dp(64f)).apply { topMargin = dp(14f) })
+        col.addView(volRow, LinearLayout.LayoutParams(MATCH, dp(60f)).apply { topMargin = dp(12f) })
 
-        col.addView(label("Приложения", 13f, alpha = 150), lp(22))
+        col.addView(label("Приложения", 13f, alpha = 150), lp(18))
         val appsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         for (a in prefs.apps) {
             appsRow.addView(
-                Glass.button(this, a.label, 0x22FFFFFF, 0x3DFFFFFF) { launchApp(a) }
-                    .apply { textSize = 13f },
+                Glass.button(this, a.label, 0x22FFFFFF, 0x3DFFFFFF) { launchApp(a.pkg, a.label) }.apply { textSize = 13f },
                 LinearLayout.LayoutParams(0, WRAP, 1f).apply { if (appsRow.childCount > 0) marginStart = dp(8f) }
             )
         }
         col.addView(appsRow, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8f) })
 
-        col.addView(
-            Glass.button(this, "Настройки", 0x18FFFFFF) { showSettings() }.apply { textSize = 13f },
-            lp(22)
-        )
-
-        val cap = KeyCaptureView(this, { text -> sendText(text) }, { code -> sendRawKey(code) })
+        val cap = KeyCaptureView(this, { text -> sendText(text) }, { code -> sendKey(code) })
         capture = cap
         val frame = FrameLayout(this)
         frame.addView(ScrollView(this).apply { addView(col) }, FrameLayout.LayoutParams(MATCH, MATCH))
         frame.addView(cap, FrameLayout.LayoutParams(1, 1))
-        setScreen(frame)
+        return frame
     }
 
     private fun dpad(): View {
-        val size = dp(260f)
-        val btn = dp(84f)
+        val size = dp(250f)
+        val btn = dp(80f)
         val frame = FrameLayout(this)
         frame.layoutParams = ViewGroup.LayoutParams(size, size)
         frame.background = Glass.circle(this, 0x14FFFFFF, 0x30FFFFFF)
@@ -235,25 +301,24 @@ class MainActivity : Activity() {
             isClickable = true
             setOnClickListener { sendKey(RemoteKeys.CENTER) }
         }
-        frame.addView(ok, FrameLayout.LayoutParams(dp(92f), dp(92f), Gravity.CENTER))
+        frame.addView(ok, FrameLayout.LayoutParams(dp(88f), dp(88f), Gravity.CENTER))
         return frame
     }
 
     private fun rowLp() = LinearLayout.LayoutParams(0, MATCH, 1f).apply { marginStart = dp(6f); marginEnd = dp(6f) }
 
-    // ------------------------------------------------------------------ settings
-    private fun showSettings() {
+    // ------------------------------------------------------------------ "more" tab (app shortcuts + key)
+    private fun buildMoreScreen(): View {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20f), dp(26f), dp(20f), dp(20f))
+            setPadding(dp(20f), dp(22f), dp(20f), dp(16f))
         }
-        col.addView(label("Настройки", 26f, bold = true))
+        col.addView(label("Ещё", 26f, bold = true))
         col.addView(
             label(
                 "Пакеты YouTube и Netflix проверены для Android TV. RuTube и Кинопоиск отличаются " +
                     "по регионам и устройствам — если кнопка не открывает нужное приложение, впишите " +
-                    "точное имя пакета сюда. Узнать его: установите приложение на телевизоре и выполните " +
-                    "«adb shell pm list packages | grep <название>» с компьютера, либо посмотрите на сайте приложения.",
+                    "точное имя пакета сюда. Узнать его можно и на вкладке «Приложения».",
                 13f, alpha = 170
             ),
             lp(8)
@@ -273,17 +338,19 @@ class MainActivity : Activity() {
             a to e
         }
         col.addView(
-            Glass.button(this, "Сохранить", 0x553A7BFF, 0x883A7BFF.toInt()) {
+            Glass.button(this, "Сохранить ярлыки приложений", 0x553A7BFF, 0x883A7BFF.toInt()) {
                 prefs.apps = fields.map { (a, e) -> AppShortcut(a.id, a.label, e.text.toString().trim().ifEmpty { a.pkg }) }
                 toast("Сохранено")
-                showRemote()
+                remoteScreen = null
+                showTab(0)
             },
             lp(20)
         )
         col.addView(
             Glass.button(this, "Сбросить пакеты к значениям по умолчанию", 0x18FFFFFF) {
-                prefs.apps = com.example.tvremote.core.DefaultApps.defaults()
-                showSettings()
+                prefs.apps = DefaultApps.defaults()
+                moreScreen = null
+                showTab(3)
             },
             lp(10)
         )
@@ -294,11 +361,10 @@ class MainActivity : Activity() {
             },
             lp(24)
         )
-        col.addView(Glass.button(this, "Назад") { showRemote() }, lp(10))
-        setScreen(ScrollView(this).apply { addView(col) })
+        return ScrollView(this).apply { addView(col) }
     }
 
-    // ------------------------------------------------------------------ actions
+    // ------------------------------------------------------------------ shared actions (used by the tabs)
     private fun sendKey(code: Int) {
         val c = client ?: return
         io.execute {
@@ -309,8 +375,6 @@ class MainActivity : Activity() {
             }
         }
     }
-
-    private fun sendRawKey(code: Int) = sendKey(code)
 
     private fun sendText(text: String) {
         val c = client ?: return
@@ -323,22 +387,109 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun launchApp(app: AppShortcut) {
-        val c = client ?: return
-        toast("Открываю ${app.label}…")
+    /** Runs an arbitrary shell command on the TV and delivers the result on the UI thread. Used by the Apps
+     * and TV-settings tabs. */
+    fun runShell(command: String, timeoutMs: Int = 8000, onResult: (ShellResult) -> Unit) {
+        val c = client
+        if (c == null) {
+            onResult(ShellResult(false, "не подключено"))
+            return
+        }
         io.execute {
-            try {
-                val r = c.shell("monkey -p ${app.pkg} -c android.intent.category.LAUNCHER 1")
-                val failed = r.output.contains("No activities found") || r.output.contains("Exception") || !r.ok
-                runOnUiThread {
-                    if (failed) toast("«${app.label}» не найдено на этом ТВ (пакет ${app.pkg}). Поправьте в Настройках.")
-                }
+            val r = try {
+                c.shell(command, timeoutMs)
             } catch (e: Exception) {
                 runOnUiThread { onLost(e) }
+                ShellResult(false, e.message ?: "ошибка сети")
+            }
+            runOnUiThread { onResult(r) }
+        }
+    }
+
+    fun launchApp(pkg: String, label: String? = null) {
+        toast("Открываю ${label ?: pkg}…")
+        runShell(ShellCommands.launch(pkg)) { r ->
+            val failed = r.output.contains("No activities found") || r.output.contains("Exception") || !r.ok
+            if (failed) toast("«${label ?: pkg}» не найдено на этом ТВ (пакет $pkg).")
+        }
+    }
+
+    // ------------------------------------------------------------------ APK install
+    fun pickApkToInstall() {
+        val i = Intent(Intent.ACTION_GET_CONTENT)
+            .setType("application/vnd.android.package-archive")
+            .addCategory(Intent.CATEGORY_OPENABLE)
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(i, REQ_APK)
+        } catch (e: Exception) {
+            toast("Не найдено приложение для выбора файла")
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_APK || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        installApk(uri)
+    }
+
+    private fun installApk(uri: Uri) {
+        val c = client ?: return
+        val dialog = installProgressDialog()
+        io.execute {
+            val bytes = try {
+                contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            } catch (e: Exception) {
+                null
+            }
+            if (bytes == null) {
+                runOnUiThread { dialog.dismiss(); toast("Не удалось прочитать файл") }
+                return@execute
+            }
+            if (bytes.size > MAX_APK_BYTES) {
+                runOnUiThread { dialog.dismiss(); toast("Файл слишком большой (>${MAX_APK_BYTES / 1_000_000} МБ)") }
+                return@execute
+            }
+            try {
+                val r = c.installApk(bytes) { sent, total ->
+                    runOnUiThread { dialog.setProgress((sent * 100 / total).toInt()) }
+                }
+                runOnUiThread {
+                    dialog.dismiss()
+                    if (r.output.contains("Success")) {
+                        toast("Установлено")
+                        appsScreen?.refresh()
+                    } else {
+                        toast("Ошибка установки: ${r.output.trim().ifEmpty { "нет ответа от ТВ" }}")
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread { dialog.dismiss(); onLost(e) }
             }
         }
     }
 
+    private fun installProgressDialog(): InstallDialog {
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            isIndeterminate = false
+        }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24f), dp(20f), dp(24f), dp(20f))
+            addView(label("Устанавливаю на телевизор…", 15f))
+            addView(bar, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(14f) })
+        }
+        val dialog = Dialog(this)
+        dialog.setContentView(col)
+        dialog.setCancelable(false)
+        dialog.show()
+        return InstallDialog(dialog, bar)
+    }
+
+    // ------------------------------------------------------------------ misc
     private fun toggleKeyboard() {
         val cap = capture ?: return
         val imm = getSystemService(android.view.inputmethod.InputMethodManager::class.java)
@@ -373,5 +524,7 @@ class MainActivity : Activity() {
     private companion object {
         const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+        const val REQ_APK = 31
+        const val MAX_APK_BYTES = 300 * 1_000_000
     }
 }
