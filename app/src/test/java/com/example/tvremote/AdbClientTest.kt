@@ -13,7 +13,11 @@ import java.util.concurrent.Future
 import kotlin.random.Random
 
 /** A tiny stand-in for adbd: enough of the handshake and shell protocol to exercise AdbClient end to end. */
-private class FakeAdbd(private val trustedKey: java.security.PublicKey?, private val approveOnPubkey: Boolean) {
+private class FakeAdbd(
+    private val trustedKey: java.security.PublicKey?,
+    private val approveOnPubkey: Boolean,
+    private val handleShellAfterConnect: Boolean = false,
+) {
     val port: Int
     private val server = ServerSocket(0)
     private val pool = Executors.newCachedThreadPool()
@@ -65,6 +69,8 @@ private class FakeAdbd(private val trustedKey: java.security.PublicKey?, private
             send(s, AdbProtocol.CMD_CNXN, AdbProtocol.CONNECT_VERSION, AdbProtocol.CONNECT_MAXDATA, AdbProtocol.connectBanner())
         }
 
+        if (!handleShellAfterConnect) return
+
         // shell: open -> write some output in two chunks -> close
         h = readHeader(s)
         val openPayload = readPayload(s, h)
@@ -92,7 +98,7 @@ class AdbClientTest {
         val accept = server.acceptOnce()
         val client = AdbClient("127.0.0.1", server.port, kp)
         val result = client.connect()
-        accept.get()
+        accept.get(5, java.util.concurrent.TimeUnit.SECONDS)
         assertTrue(result is AdbResult.Connected)
         assertTrue(client.connected)
     }
@@ -103,7 +109,7 @@ class AdbClientTest {
         val accept = server.acceptOnce()
         val client = AdbClient("127.0.0.1", server.port, kp)
         val result = client.connect()
-        accept.get()
+        accept.get(5, java.util.concurrent.TimeUnit.SECONDS)
         assertTrue(result is AdbResult.Connected)
     }
 
@@ -113,18 +119,18 @@ class AdbClientTest {
         val accept = server.acceptOnce()
         val client = AdbClient("127.0.0.1", server.port, kp)
         val result = client.connect(approvalTimeoutMs = 1500)
-        accept.get()
+        accept.get(5, java.util.concurrent.TimeUnit.SECONDS)
         assertTrue(result is AdbResult.AwaitingApproval || result is AdbResult.Failed)
     }
 
     @Test fun shellCommandRoundTripsOutputAndClosesCleanly() {
         val kp = keyPair()
-        val server = FakeAdbd(trustedKey = kp.public, approveOnPubkey = true)
+        val server = FakeAdbd(trustedKey = kp.public, approveOnPubkey = true, handleShellAfterConnect = true)
         val accept = server.acceptOnce()
         val client = AdbClient("127.0.0.1", server.port, kp)
         assertTrue(client.connect() is AdbResult.Connected)
         val result = client.shell("input keyevent 22")
-        accept.get()
+        accept.get(5, java.util.concurrent.TimeUnit.SECONDS)
         assertTrue(result.ok)
         assertEquals("hello world", result.output)
         assertEquals("input keyevent 22", server.sawShellCommand)
