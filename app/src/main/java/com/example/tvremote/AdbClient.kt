@@ -3,8 +3,6 @@ package com.example.tvremote
 import com.example.tvremote.core.AdbProtocol
 import com.example.tvremote.core.AdbRsaKey
 import java.io.IOException
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.security.KeyPair
 
 sealed class AdbResult {
@@ -17,29 +15,35 @@ sealed class AdbResult {
 class ShellResult(val ok: Boolean, val output: String)
 
 /**
- * A minimal ADB client: TCP transport + the CNXN/AUTH handshake + one-shot `shell:`/`exec:` streams. This is
- * the same wire protocol the `adb` desktop tool speaks (see core.AdbProtocol); only what this app needs is
- * implemented (no file sync service, no port forwarding, no interactive shell).
+ * A minimal ADB client: the CNXN/AUTH handshake + one-shot `shell:`/`exec:`/`tcpip:` streams, over any
+ * [AdbTransport] (TCP socket or a direct USB-OTG cable). This is the same wire protocol the `adb` desktop tool
+ * speaks (see core.AdbProtocol); only what this app needs is implemented (no file sync service, no port
+ * forwarding, no interactive shell).
  */
-class AdbClient(private val host: String, private val port: Int, private val keyPair: KeyPair) {
-    private var socket: Socket? = null
+class AdbClient(private val keyPair: KeyPair) {
+    private var transport: AdbTransport? = null
     private var nextLocalId = 1
     @Volatile var connected = false
         private set
 
     @Synchronized
     @Throws(IOException::class)
-    fun connect(connectTimeoutMs: Int = 6000, approvalTimeoutMs: Int = 25_000): AdbResult {
-        close()
-        val s = Socket()
-        s.tcpNoDelay = true
-        s.connect(InetSocketAddress(host, port), connectTimeoutMs)
-        s.soTimeout = connectTimeoutMs
-        socket = s
+    fun connectTcp(host: String, port: Int, connectTimeoutMs: Int = 6000, approvalTimeoutMs: Int = 25_000): AdbResult =
+        connect(SocketTransport(host, port, connectTimeoutMs), connectTimeoutMs, approvalTimeoutMs)
 
-        send(s, AdbProtocol.CMD_CNXN, AdbProtocol.CONNECT_VERSION, AdbProtocol.CONNECT_MAXDATA, AdbProtocol.connectBanner())
-        var header = readHeader(s) ?: return fail("Нет ответа от телевизора")
-        var payload = readPayload(s, header)
+    @Synchronized
+    @Throws(IOException::class)
+    fun connectUsb(t: UsbTransport, connectTimeoutMs: Int = 6000, approvalTimeoutMs: Int = 25_000): AdbResult =
+        connect(t, connectTimeoutMs, approvalTimeoutMs)
+
+    private fun connect(t: AdbTransport, connectTimeoutMs: Int, approvalTimeoutMs: Int): AdbResult {
+        close()
+        transport = t
+        t.setTimeout(connectTimeoutMs)
+
+        send(t, AdbProtocol.CMD_CNXN, AdbProtocol.CONNECT_VERSION, AdbProtocol.CONNECT_MAXDATA, AdbProtocol.connectBanner())
+        var header = readHeader(t) ?: return fail("Нет ответа от телевизора")
+        var payload = readPayload(t, header)
 
         if (header.cmd == AdbProtocol.CMD_CNXN) {
             connected = true
@@ -51,8 +55,8 @@ class AdbClient(private val host: String, private val port: Int, private val key
 
         // Attempt 1: sign with our stored key (works instantly on a TV that already trusts it).
         val sig = AdbRsaKey.sign(payload, keyPair.private)
-        send(s, AdbProtocol.CMD_AUTH, AdbProtocol.AUTH_SIGNATURE, 0, sig)
-        header = readHeader(s) ?: return fail("Соединение прервалось во время проверки")
+        send(t, AdbProtocol.CMD_AUTH, AdbProtocol.AUTH_SIGNATURE, 0, sig)
+        header = readHeader(t) ?: return fail("Соединение прервалось во время проверки")
         if (header.cmd == AdbProtocol.CMD_CNXN) {
             connected = true
             return AdbResult.Connected
@@ -60,13 +64,13 @@ class AdbClient(private val host: String, private val port: Int, private val key
         if (header.cmd != AdbProtocol.CMD_AUTH || header.arg0 != AdbProtocol.AUTH_TOKEN) {
             return fail("Телевизор отклонил подключение")
         }
-        payload = readPayload(s, header)   // a fresh token for the public-key attempt
+        payload = readPayload(t, header)   // a fresh token for the public-key attempt
 
         // Attempt 2: offer our public key; the TV will show a one-time approval dialog.
         val pub = AdbRsaKey.publicKeyPayload(keyPair.public, "tv-remote")
-        send(s, AdbProtocol.CMD_AUTH, AdbProtocol.AUTH_RSAPUBLICKEY, 0, pub)
-        s.soTimeout = approvalTimeoutMs
-        header = readHeader(s) ?: return AdbResult.AwaitingApproval
+        send(t, AdbProtocol.CMD_AUTH, AdbProtocol.AUTH_RSAPUBLICKEY, 0, pub)
+        t.setTimeout(approvalTimeoutMs)
+        header = readHeader(t) ?: return AdbResult.AwaitingApproval
         return if (header.cmd == AdbProtocol.CMD_CNXN) {
             connected = true
             AdbResult.Connected
@@ -79,8 +83,18 @@ class AdbClient(private val host: String, private val port: Int, private val key
     @Synchronized
     @Throws(IOException::class)
     fun shell(command: String, timeoutMs: Int = 8000): ShellResult {
-        val s = socket ?: return ShellResult(false, "не подключено")
-        return runStream(s, AdbProtocol.shellService(command), null, timeoutMs, null)
+        val t = transport ?: return ShellResult(false, "не подключено")
+        return runStream(t, AdbProtocol.shellService(command), null, timeoutMs, null)
+    }
+
+    /** Sends the special `tcpip:<port>` service: the device's adbd restarts listening for network connections
+     * on that port — exactly what `adb tcpip <port>` does from a desktop, just issued over this USB link. */
+    @Synchronized
+    @Throws(IOException::class)
+    fun enableTcpip(port: Int, timeoutMs: Int = 8000): ShellResult {
+        val t = transport ?: return ShellResult(false, "не подключено")
+        val service = ("tcpip:$port\u0000").toByteArray(Charsets.UTF_8)
+        return runStream(t, service, null, timeoutMs, null)
     }
 
     /**
@@ -90,15 +104,15 @@ class AdbClient(private val host: String, private val port: Int, private val key
     @Synchronized
     @Throws(IOException::class)
     fun installApk(apk: ByteArray, timeoutMs: Int = 60_000, onProgress: ((Long, Long) -> Unit)? = null): ShellResult {
-        val s = socket ?: return ShellResult(false, "не подключено")
+        val t = transport ?: return ShellResult(false, "не подключено")
         val service = ("exec:" + com.example.tvremote.core.ShellCommands.installFromStdin(apk.size.toLong()) + "\u0000")
             .toByteArray(Charsets.UTF_8)
-        return runStream(s, service, apk, timeoutMs, onProgress)
+        return runStream(t, service, apk, timeoutMs, onProgress)
     }
 
     fun close() {
-        try { socket?.close() } catch (e: IOException) { }
-        socket = null
+        try { transport?.close() } catch (e: Exception) { }
+        transport = null
         connected = false
     }
 
@@ -111,34 +125,34 @@ class AdbClient(private val host: String, private val port: Int, private val key
     /** Opens one `service` stream, optionally pushes [pushData] to its stdin first, then collects whatever the
      * device writes back until it closes the stream. */
     private fun runStream(
-        s: Socket, service: ByteArray, pushData: ByteArray?, timeoutMs: Int, onProgress: ((Long, Long) -> Unit)?,
+        t: AdbTransport, service: ByteArray, pushData: ByteArray?, timeoutMs: Int, onProgress: ((Long, Long) -> Unit)?,
     ): ShellResult {
-        s.soTimeout = timeoutMs
+        t.setTimeout(timeoutMs)
         val localId = nextLocalId++
-        send(s, AdbProtocol.CMD_OPEN, localId, 0, service)
+        send(t, AdbProtocol.CMD_OPEN, localId, 0, service)
 
         var remoteId = -1
         var pushed = false
         val out = StringBuilder()
         while (true) {
-            val header = readHeader(s) ?: return ShellResult(false, out.toString())
-            val payload = readPayload(s, header)
+            val header = readHeader(t) ?: return ShellResult(false, out.toString())
+            val payload = readPayload(t, header)
             when (header.cmd) {
                 AdbProtocol.CMD_OKAY -> {
                     if (remoteId < 0) {
                         remoteId = header.arg0
                         if (pushData != null && !pushed) {
                             pushed = true
-                            pushAll(s, localId, remoteId, pushData, onProgress)
+                            pushAll(t, localId, remoteId, pushData, onProgress)
                         }
                     }
                 }
                 AdbProtocol.CMD_WRTE -> {
                     out.append(payload.toString(Charsets.UTF_8))
-                    send(s, AdbProtocol.CMD_OKAY, localId, header.arg0, ByteArray(0))
+                    send(t, AdbProtocol.CMD_OKAY, localId, header.arg0, ByteArray(0))
                 }
                 AdbProtocol.CMD_CLSE -> {
-                    send(s, AdbProtocol.CMD_CLSE, localId, if (remoteId >= 0) remoteId else header.arg0, ByteArray(0))
+                    send(t, AdbProtocol.CMD_CLSE, localId, if (remoteId >= 0) remoteId else header.arg0, ByteArray(0))
                     return ShellResult(true, out.toString())
                 }
                 else -> { /* ignore anything unrelated to this stream */ }
@@ -149,14 +163,14 @@ class AdbClient(private val host: String, private val port: Int, private val key
     /** Writes [data] as a sequence of WRTE chunks, each acknowledged by the device before the next is sent
      * (the same flow control the real ADB sync/exec file transfer uses), well under any device's advertised
      * max payload so we never need to know what that is. */
-    private fun pushAll(s: Socket, localId: Int, remoteId: Int, data: ByteArray, onProgress: ((Long, Long) -> Unit)?) {
+    private fun pushAll(t: AdbTransport, localId: Int, remoteId: Int, data: ByteArray, onProgress: ((Long, Long) -> Unit)?) {
         var offset = 0
         val total = data.size.toLong()
         while (offset < data.size) {
             val len = minOf(PUSH_CHUNK, data.size - offset)
-            send(s, AdbProtocol.CMD_WRTE, localId, remoteId, data.copyOfRange(offset, offset + len))
-            val ackHeader = readHeader(s) ?: throw IOException("Телевизор прервал передачу")
-            readPayload(s, ackHeader)
+            send(t, AdbProtocol.CMD_WRTE, localId, remoteId, data.copyOfRange(offset, offset + len))
+            val ackHeader = readHeader(t) ?: throw IOException("Телевизор прервал передачу")
+            readPayload(t, ackHeader)
             if (ackHeader.cmd != AdbProtocol.CMD_OKAY) {
                 throw IOException("Неожиданный ответ во время передачи (" + AdbProtocol.cmdName(ackHeader.cmd) + ")")
             }
@@ -165,33 +179,22 @@ class AdbClient(private val host: String, private val port: Int, private val key
         }
     }
 
-    private fun send(s: Socket, cmd: Int, arg0: Int, arg1: Int, payload: ByteArray) {
-        s.getOutputStream().write(AdbProtocol.encodeMessage(cmd, arg0, arg1, payload))
+    private fun send(t: AdbTransport, cmd: Int, arg0: Int, arg1: Int, payload: ByteArray) {
+        t.write(AdbProtocol.encodeMessage(cmd, arg0, arg1, payload))
     }
 
-    private fun readHeader(s: Socket): AdbProtocol.Header? {
+    private fun readHeader(t: AdbTransport): AdbProtocol.Header? {
         val buf = ByteArray(AdbProtocol.HEADER_SIZE)
-        if (!readFully(s, buf)) return null
+        if (!t.readFully(buf)) return null
         val h = AdbProtocol.parseHeader(buf)
         return if (h.magicOk()) h else null
     }
 
-    private fun readPayload(s: Socket, header: AdbProtocol.Header): ByteArray {
+    private fun readPayload(t: AdbTransport, header: AdbProtocol.Header): ByteArray {
         if (header.dataLength == 0) return ByteArray(0)
         val buf = ByteArray(header.dataLength)
-        if (!readFully(s, buf)) return ByteArray(0)
+        if (!t.readFully(buf)) return ByteArray(0)
         return buf
-    }
-
-    private fun readFully(s: Socket, buf: ByteArray): Boolean {
-        var off = 0
-        val inp = s.getInputStream()
-        while (off < buf.size) {
-            val n = inp.read(buf, off, buf.size - off)
-            if (n < 0) return false
-            off += n
-        }
-        return true
     }
 
     private companion object {

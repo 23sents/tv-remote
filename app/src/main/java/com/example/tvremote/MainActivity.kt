@@ -64,10 +64,41 @@ class MainActivity : Activity() {
         showConnect()
     }
 
+    private val usbPairing by lazy { UsbPairing(this, io) }
+
     override fun onDestroy() {
         client?.close()
+        usbPairing.dispose()
         io.shutdownNow()
         super.onDestroy()
+    }
+
+    private fun startUsbPairing(statusText: TextView, hostField: EditText, portField: EditText) {
+        val port = portField.text.toString().trim().toIntOrNull() ?: 5555
+        statusText.text = "Ищу телевизор на USB…"
+        usbPairing.start(keyStore.load(), port, object : UsbPairing.Listener {
+            override fun onStatus(message: String) {
+                runOnUiThread { statusText.text = message }
+            }
+
+            override fun onReadyForWifi(ip: String?, readyPort: Int) {
+                runOnUiThread {
+                    portField.setText(readyPort.toString())
+                    if (ip != null) {
+                        hostField.setText(ip)
+                        statusText.text = "Сеть включена на $ip — подключаюсь…"
+                        connectTo(ip, readyPort, statusText)
+                    } else {
+                        statusText.text = "Сеть на телевизоре включена, но определить его IP не удалось. " +
+                            "Введите IP вручную (см. Настройки → Сеть на ТВ) и нажмите «Подключиться»."
+                    }
+                }
+            }
+
+            override fun onFailed(message: String) {
+                runOnUiThread { statusText.text = "USB: $message" }
+            }
+        })
     }
 
     private fun setScreen(v: View) {
@@ -133,6 +164,19 @@ class MainActivity : Activity() {
         )
         col.addView(statusText, lp(14))
 
+        col.addView(
+            Glass.button(this, "Подключить по USB (без компьютера)", 0x18FFFFFF) { startUsbPairing(statusText, host, port) },
+            lp(14)
+        )
+        col.addView(
+            label(
+                "Нужен OTG-кабель/переходник и порт ТВ, который умеет работать как USB-устройство — " +
+                    "это зависит от конкретной модели и заранее не определить, кроме как попробовав.",
+                11f, alpha = 130
+            ),
+            lp(4)
+        )
+
         if (prefs.recent.isNotEmpty()) {
             col.addView(label("Недавние", 13f, alpha = 150), lp(22))
             val list = ListView(this)
@@ -153,9 +197,9 @@ class MainActivity : Activity() {
         statusText.text = "Подключение…"
         io.execute {
             val kp = keyStore.load()
-            val c = AdbClient(host, port, kp)
+            val c = AdbClient(kp)
             val result = try {
-                c.connect()
+                c.connectTcp(host, port)
             } catch (e: Exception) {
                 AdbResult.Failed(e.message ?: "Ошибка сети")
             }

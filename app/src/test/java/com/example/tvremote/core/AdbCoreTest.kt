@@ -142,6 +142,16 @@ class AdbCoreTest {
         assertEquals(null, ShellCommands.parsePackageLine("package:"))
     }
 
+    @Test fun parseDetectedIpExtractsSrcAddress() {
+        assertEquals(
+            "192.168.1.42",
+            ShellCommands.parseDetectedIp("1.1.1.1 via 192.168.1.1 dev wlan0 src 192.168.1.42 uid 2000 \n    cache")
+        )
+        assertEquals("10.0.0.5", ShellCommands.parseDetectedIp("1.1.1.1 dev eth0 src 10.0.0.5"))
+        assertEquals(null, ShellCommands.parseDetectedIp("RTNETLINK answers: Network is unreachable"))
+        assertEquals(null, ShellCommands.parseDetectedIp(""))
+    }
+
     @Test fun shellQuoteEscapesSingleQuotes() {
         assertEquals("'hello'", ShellQuote.single("hello"))
         assertEquals("'it'\\''s'", ShellQuote.single("it's"))

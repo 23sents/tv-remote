@@ -33,6 +33,16 @@ object ShellCommands {
 
     fun openDisplaySettings(): String = "am start -a android.settings.DISPLAY_SETTINGS"
 
+    /** Asks the kernel which local address it would use to reach the internet — the simplest reliable way to
+     * find the device's own LAN IP regardless of whether it's on wlan0, eth0, or something OEM-specific. */
+    fun detectIp(): String = "ip route get 1.1.1.1"
+
+    private val SRC_IP = Regex("""src (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})""")
+
+    /** Pulls the "src X.X.X.X" address out of `ip route get` output, e.g.
+     * "1.1.1.1 via 192.168.1.1 dev wlan0 src 192.168.1.42 uid 2000" -> "192.168.1.42". */
+    fun parseDetectedIp(output: String): String? = SRC_IP.find(output)?.groupValues?.get(1)
+
     /** Parses one line of `pm list packages -f`: "package:/data/app/.../base.apk=com.example.app". */
     fun parsePackageLine(line: String): InstalledApp? {
         val body = line.removePrefix("package:").trim()
